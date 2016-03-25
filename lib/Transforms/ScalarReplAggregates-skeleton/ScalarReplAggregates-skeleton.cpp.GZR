@@ -1,0 +1,325 @@
+//===- ScalarReplAggregates.cpp - Scalar Replacement of Aggregates --------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file was developed by the LLVM research group and is distributed under
+// the University of Illinois Open Source License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This transformation implements the well known scalar replacement of
+// aggregates transformation.  This xform breaks up alloca instructions of
+// structure type into individual alloca instructions for
+// each member, when legal.  Then, if legal, it transforms the individual
+// alloca instructions into nice clean scalar SSA form.
+//
+// This combines a simple SRoA algorithm with Mem2Reg because they
+// often interact, especially for C++ programs.  As such, iterating between
+// SRoA and Mem2Reg until we run out of things to promote works well.
+//
+//===----------------------------------------------------------------------===//
+
+/*
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AliasSetTracker.h"
+//#include "llvm/Target/TargetData.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
+*/
+
+#include "llvm/Analysis/AliasSetTracker.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/Loads.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/CallSite.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/Transforms/Utils/SSAUpdater.h"
+
+using namespace llvm;
+#define DEBUG_TYPE "ScalarReplAggregates"
+
+STATISTIC(NumExpanded,  "Number of aggregate allocas broken up");
+STATISTIC(NumPromoted,  "Number of scalar allocas promoted to register");
+
+namespace {
+  //--------------------------------------------------------------------------//
+  // class SROA: Scalar Replacement of Aggregates function pass.
+  // 
+  // The main entry point is runOnFunction.
+  // The pass is registered using the declaration of a static global
+  // variable (X) below.
+  //--------------------------------------------------------------------------//
+  
+  struct SROA : public FunctionPass {
+    static char ID;             // Pass identification
+    
+    SROA() : FunctionPass(ID) { }
+
+    // Entry point for the overall scalar-replacement pass
+    bool runOnFunction(Function &F);
+
+    // Promotes allocas to registers, which can enable more scalar replacement
+    bool performPromotion(Function &F);
+
+    // Entry point for the scalar-replacement transformation itself
+    bool performScalarRepl(Function &F);
+
+    // getAnalysisUsage - This pass does not require any passes, but we know it
+    // will not alter the CFG, so say so.
+    virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+      AU.addRequired<AssumptionCacheTracker>();
+      AU.addRequired<DominatorTreeWrapperPass>();
+      AU.setPreservesCFG();
+    }
+
+  private:
+    // Add fields and helper functions for this pass here.
+    // To check all getelementptr instruction that satisfies U1 conditions:
+    bool checkU1Condition(AllocaInst *AI);
+  };
+}
+
+//--------------------------------------------------------------------------//
+// Register the pass so it is accessible from the command line,
+// via the pass manager.
+//--------------------------------------------------------------------------//
+char SROA::ID = 0;
+static RegisterPass<SROA> X("scalarrepl-assn2",
+          "My Scalar Replacement of Aggregates", false, true);
+
+//----------------------------------------------------------------------------//
+// 
+// Function runOnFunction:
+// Entry point for the overall ScalarReplAggregates function pass.
+// This function is provided to you.
+// 
+//----------------------------------------------------------------------------//
+
+bool SROA::runOnFunction(Function &F) {
+
+  bool Changed = performPromotion(F);
+  
+  while (1) {
+    bool LocalChange = performScalarRepl(F);
+    if (!LocalChange) break;   // No need to repromote if no scalarrepl
+    Changed = true;
+    LocalChange = performPromotion(F);
+    if (!LocalChange) break;   // No need to re-scalarrepl if no promotion
+  }
+
+  return Changed;
+}
+
+
+//----------------------------------------------------------------------------//
+// Function performPromotion:
+// Promote allocas to registers, which can enable more scalar replacement.
+//----------------------------------------------------------------------------//
+
+bool SROA::performPromotion(Function &F) {
+  std::vector<AllocaInst*> Allocas;
+  //const DataLayout &DL = F.getParent()->getDataLayout();
+  
+  DominatorTree *DT = nullptr;
+    DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+  AssumptionCache &AC =
+      getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
+
+  BasicBlock &BB = F.getEntryBlock();  // Get the entry node for the function
+  //
+  DIBuilder DIB(*F.getParent(), /*AllowUnresolved*/ false);
+  bool Changed = false;
+  SmallVector<Instruction*, 64> Insts;
+  while (1) {
+    Allocas.clear();
+
+    // Find allocas that are safe to promote, by looking at all instructions in
+    // the entry node
+    for (BasicBlock::iterator I = BB.begin(), E = --BB.end(); I != E; ++I)
+      if (AllocaInst *AI = dyn_cast<AllocaInst>(I))       // Is it an alloca?
+        if (isAllocaPromotable(AI))
+          Allocas.push_back(AI);
+
+    if (Allocas.empty()) break;
+
+    PromoteMemToReg(Allocas, *DT, nullptr, &AC);
+    NumPromoted += Allocas.size();
+    Changed = true;
+  }
+
+  return Changed;
+
+}
+
+
+//----------------------------------------------------------------------------//
+// Function performScalarRepl:
+// Entry point for a single pass of the scalar-replacement transformation itself.
+//----------------------------------------------------------------------------//
+
+bool SROA::performScalarRepl(Function &F) {
+  
+  std::vector<AllocaInst*> AllocasToEliminate;
+  std::vector<AllocaInst*> AllocasInside;
+  // values are already replaced
+  std::vector<Value*> ReplacedInsts;
+  bool localChanged = false;
+
+  BasicBlock &BB = F.getEntryBlock();  // Get the entry node for the function
+
+  for (BasicBlock::iterator I = BB.begin(), E = --BB.end(); I != E; ++I){
+    if (AllocaInst *AI = dyn_cast<AllocaInst>(I))       // Is it an alloca?
+        AllocasToEliminate.push_back(AI);
+  }
+  //Repeat iterating all the structures until no more structure allocations can be eliminated
+  while(!AllocasToEliminate.empty()){
+    //go through each Alloca instruction
+    AllocaInst *AI_elim = AllocasToEliminate.back();
+    AllocasToEliminate.pop_back();
+
+    //check if the Alloca instruction is struct type
+    if (!isa<StructType>(AI_elim->getAllocatedType()))
+    {
+      continue;
+    }
+    // check if the Alloca instruction satisfies U1 condition
+    else if (!checkU1Condition(AI_elim))
+    {
+      continue;
+    }
+
+    // break down the suitable Alloca instructions 
+    // build Alloca instruction for each element inside
+    if (StructType *ST = dyn_cast<StructType>(AI_elim->getAllocatedType()))
+    {
+      AllocasInside.reserve(ST->getNumContainedTypes());
+      int num = ST->getNumContainedTypes();
+      for (int i = 0, e =num; i != e; ++i)
+      {
+        AllocaInst *new_AI = new AllocaInst(ST->getContainedType(i), nullptr, AI_elim->getAlignment(), 
+                                              AI_elim->getName() + "-" + Twine(i), AI_elim);
+        AllocasInside.push_back(new_AI);
+        // There can be structures nested inside structures.
+        AllocasToEliminate.push_back(new_AI);
+      }
+    }
+    for (Value::user_iterator I = AI_elim->user_begin(), E = AI_elim->user_end(); I != E; ++I) {
+      if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(*I)) {
+        int i = cast<ConstantInt>(GEP->getOperand(2))->getLimitedValue();
+
+        AllocaInst *AItoBeReplaced = AllocasInside[i];
+        Value *ReplacedValue;
+        ReplacedValue = AItoBeReplaced;
+
+        GEP->replaceAllUsesWith(ReplacedValue);
+        ReplacedInsts.push_back(GEP);   
+      } 
+    }
+
+    // delete all replaced instructions 
+    while(!ReplacedInsts.empty()) {
+      Instruction *Inst = cast<Instruction>(ReplacedInsts.back());
+      ReplacedInsts.pop_back();
+      Inst->eraseFromParent();
+    }
+
+    NumExpanded++;
+    localChanged = true;
+  }
+
+  return localChanged;
+}
+
+//----------------------------------------------------------------------------//
+// Function checkU1Condition:
+// To check all getelementptr instruction that satisfies U1 conditions:
+// 1: It is of the form: getelementptr ptr, 0, constant
+// 2: The result of the getelementptr is only used in instructions of type U1, or as the pointer argument of a load or store instruction, 
+// i.e., the pointer stored into (not the value being stored).
+//----------------------------------------------------------------------------//
+bool SROA::checkU1Condition(AllocaInst *AI)
+{
+    for (Value::user_iterator I = AI->user_begin(), E = AI->user_end(); I != E; ++I) {
+
+    GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(*I);
+    //if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(*I)) {
+
+      // if (pGEPInst->getNumIndices() != 2) {
+      //   DEBUG(errs() << "Must only have 2 constant elements: " << pGEPInst << "\n");
+      //   return false;
+      // }
+
+      // Form should be ptr, 0, constant
+      if (!isa<PointerType>(GEP->getPointerOperandType())) {
+        return false;
+      }
+
+      // // the second operand can not be a constant expression
+      // if (isa<ConstantExpr>(GEP->getOperand(2))) {
+      //   DEBUG(errs() << "second operand is constant expression: " << pGEPInst << "\n");
+      //   return false;
+      // }
+
+      if (!(cast<Constant>(GEP->getOperand(1)))->isZeroValue() ){
+        //DEBUG(errs() << "first operand is not zero: " << pGEPInst << "\n");
+        return false;
+      }
+
+      if (!isa<Constant>(GEP->getOperand(2))) {
+        //DEBUG(errs() << "second operand is not constant: " << pGEPInst << "\n");
+        return false;
+      }
+    //}
+    //else
+    /*{
+      // if there is a use case of the struct that is not gep, then I should not change it
+      DEBUG(errs() << "the user of this alloca is not a GEP " << *HEAD << "\n");
+      return false;
+    }*/
+  } // for loop use all use case
+
+  // all uses for this alloca inst pass the check
+  return true;
+}
+
+

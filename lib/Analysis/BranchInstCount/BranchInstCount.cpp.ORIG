@@ -1,0 +1,64 @@
+//===-- BranchInstCount.cpp - Collects the count of branch instructions ---===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This pass collects the count of branch instructions and reports them
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Analysis/Passes.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Function.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/Statistic.h"
+
+#include "llvm/IR/Instructions.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "BranchInstCount"
+
+STATISTIC(NumCondBranch, "Number of conditional branches in the program");
+STATISTIC(NumUncondBranch, "Number of unconditional branches in the program");
+STATISTIC(NumEqBranch, "Number of conditional branches whose comparison type "
+                       "is equal test");
+STATISTIC(NumGTBranch, "Number of conditional branches whose comparison type "
+                        "is greater than test");
+STATISTIC(NumLTBranch, "Number of conditional branches whose comparison type "
+                        "is less than test");
+                        
+namespace {
+  class BranchInstCount : public FunctionPass {
+  
+  public:
+    static char ID;
+    BranchInstCount() : FunctionPass(ID) {  }
+
+    virtual bool runOnFunction(Function &F);
+
+    virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+      AU.setPreservesAll();
+    }
+  };
+}
+
+char BranchInstCount::ID = 0;
+static RegisterPass<BranchInstCount> X ("branchinstcount-assn1",
+                "Counts the various types of branch instructions", false, true);
+
+
+// This is the main Analysis entry point for a function.
+bool BranchInstCount::runOnFunction(Function &F) {
+  // Add your analysis here
+  // You are free to add new methods to the class
+  
+    
+  return false;
+}
